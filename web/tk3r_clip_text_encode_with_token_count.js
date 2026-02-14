@@ -9,22 +9,19 @@ app.registerExtension({
 			nodeType.prototype.onExecuted = function (message) {
 				onExecuted?.apply(this, arguments);
 
-				if (this.widgets) {
-					const pos = this.widgets.findIndex((w) => w.name === "output_text");
-					if (pos !== -1) {
-						for (let i = pos; i < this.widgets.length; i++) {
-							this.widgets[i].onRemove?.();
-						}
-						this.widgets.length = pos;
-					}
-				}
-
 				const text = message.text;
 				if (!text) { return; }
 
-				// Create widget as multiline initially to get a textarea
-				const w = ComfyWidgets["STRING"](this, "output_text", ["STRING", { multiline: true }], app).widget;
-				w.inputEl.readOnly = true;
+                let w = this.widgets?.find((w) => w.name === "output_text");
+                const isNew = !w;
+
+                if (isNew) {
+				    // Create widget as multiline initially to get a textarea
+				    const res = ComfyWidgets["STRING"](this, "output_text", ["STRING", { multiline: true }], app);
+                    w = res.widget;
+                }
+
+                w.inputEl.readOnly = true;
 				w.inputEl.style.opacity = 0.6;
 				w.value = text[0];
 
@@ -63,8 +60,10 @@ app.registerExtension({
                     this.tk3r_resized_patched = true;
                 }
 				
-                // Trigger resize to update layout immediately
-				this.onResize?.(this.size);
+                // Only trigger resize if we just added the widget or patched the method
+                if (isNew) {
+				    this.onResize?.(this.size);
+                }
 			};
 		}
 	},
