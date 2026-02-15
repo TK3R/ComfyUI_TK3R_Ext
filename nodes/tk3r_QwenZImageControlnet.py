@@ -193,21 +193,46 @@ class ZImageControlPatch:
         self.start_percent = start_percent
         self.stop_percent = stop_percent
         self.decay_mode = decay_mode
-        self.encoded_image = self.encode_latent_cond(image)
-        self.encoded_image_size = (image.shape[1], image.shape[2])
+        
+        # Logic from nodes_model_patch.py to handle optional image/inpaint_image
+        skip_encoding = False
+        if self.image is not None and self.inpaint_image is not None:
+            if self.image.shape != self.inpaint_image.shape:
+                skip_encoding = True
+
+        if skip_encoding:
+            self.encoded_image = None
+        else:
+            self.encoded_image = self.encode_latent_cond(self.image, self.inpaint_image)
+            if self.image is None:
+                self.encoded_image_size = (self.inpaint_image.shape[1], self.inpaint_image.shape[2])
+            else:
+                self.encoded_image_size = (self.image.shape[1], self.image.shape[2])
         self.temp_data = None
 
-    def encode_latent_cond(self, control_image, inpaint_image=None):
-        latent_image = comfy.latent_formats.Flux().process_in(self.vae.encode(control_image))
+    def encode_latent_cond(self, control_image=None, inpaint_image=None):
+        latent_image = None
+        if control_image is not None:
+            latent_image = comfy.latent_formats.Flux().process_in(self.vae.encode(control_image))
+
         if self.model_patch.model.additional_in_dim > 0:
-            if self.mask is None:
-                mask_ = torch.zeros_like(latent_image)[:, :1]
-            else:
-                mask_ = comfy.utils.common_upscale(self.mask.mean(dim=1, keepdim=True), latent_image.shape[-1], latent_image.shape[-2], "bilinear", "none")
             if inpaint_image is None:
                 inpaint_image = torch.ones_like(control_image) * 0.5
+            
+            if self.mask is not None:
+                # Upscale mask for inpaint image
+                mask_inpaint = comfy.utils.common_upscale(self.mask.view(self.mask.shape[0], -1, self.mask.shape[-2], self.mask.shape[-1]).mean(dim=1, keepdim=True), inpaint_image.shape[-2], inpaint_image.shape[-3], "bilinear", "center")
+                inpaint_image = ((inpaint_image - 0.5) * mask_inpaint.movedim(1, -1).round()) + 0.5
 
             inpaint_image_latent = comfy.latent_formats.Flux().process_in(self.vae.encode(inpaint_image))
+
+            if self.mask is None:
+                mask_ = torch.zeros_like(inpaint_image_latent)[:, :1]
+            else:
+                mask_ = comfy.utils.common_upscale(self.mask.view(self.mask.shape[0], -1, self.mask.shape[-2], self.mask.shape[-1]).mean(dim=1, keepdim=True).to(device=inpaint_image_latent.device), inpaint_image_latent.shape[-1], inpaint_image_latent.shape[-2], "nearest", "center")
+            
+            if latent_image is None:
+                 latent_image = comfy.latent_formats.Flux().process_in(self.vae.encode(torch.ones_like(inpaint_image) * 0.5))
 
             return torch.cat([latent_image, mask_, inpaint_image_latent], dim=1)
         else:
@@ -237,13 +262,19 @@ class ZImageControlPatch:
         vec = kwargs.get("vec")
         spacial_compression = self.vae.spacial_compression_encode()
         if self.encoded_image is None or self.encoded_image_size != (x.shape[-2] * spacial_compression, x.shape[-1] * spacial_compression):
-            image_scaled = comfy.utils.common_upscale(self.image.movedim(-1, 1), x.shape[-1] * spacial_compression, x.shape[-2] * spacial_compression, "area", "center")
+            image_scaled = None
+            if self.image is not None:
+                image_scaled = comfy.utils.common_upscale(self.image.movedim(-1, 1), x.shape[-1] * spacial_compression, x.shape[-2] * spacial_compression, "area", "center").movedim(1, -1)
+                self.encoded_image_size = (image_scaled.shape[-3], image_scaled.shape[-2])
+
             inpaint_scaled = None
             if self.inpaint_image is not None:
                 inpaint_scaled = comfy.utils.common_upscale(self.inpaint_image.movedim(-1, 1), x.shape[-1] * spacial_compression, x.shape[-2] * spacial_compression, "area", "center").movedim(1, -1)
+                if image_scaled is None:
+                     self.encoded_image_size = (inpaint_scaled.shape[-3], inpaint_scaled.shape[-2])
+
             loaded_models = comfy.model_management.loaded_models(only_currently_used=True)
-            self.encoded_image = self.encode_latent_cond(image_scaled.movedim(1, -1), inpaint_scaled)
-            self.encoded_image_size = (image_scaled.shape[-2], image_scaled.shape[-1])
+            self.encoded_image = self.encode_latent_cond(image_scaled, inpaint_scaled)
             comfy.model_management.load_models_gpu(loaded_models)
 
         cnet_blocks = self.model_patch.model.n_control_layers
@@ -314,9 +345,12 @@ class TK3RQwenImageDiffsynthControlnetAdvanced:
 
     CATEGORY = "TK3R/Advanced"
 
-    def diffsynth_controlnet(self, model, model_patch, vae, image, strength, start_percent=0.0, stop_percent=1.0, decay="none", mask=None):
+    def diffsynth_controlnet(self, model, model_patch, vae, image=None, strength=1.0, inpaint_image=None, start_percent=0.0, stop_percent=1.0, decay="none", mask=None):
         model_patched = model.clone()
-        image = image[:, :, :, :3]
+        if image is not None:
+            image = image[:, :, :, :3]
+        if inpaint_image is not None:
+            inpaint_image = inpaint_image[:, :, :, :3]
         model_sampling = model.get_model_object("model_sampling")
         if model_sampling is None:
             sigma_low, sigma_high = float("-inf"), float("inf")
@@ -330,7 +364,7 @@ class TK3RQwenImageDiffsynthControlnetAdvanced:
             mask = 1.0 - mask
 
         if isinstance(model_patch.model, comfy.ldm.lumina.controlnet.ZImage_Control):
-            patch = ZImageControlPatch(model_patch, vae, image, strength, mask=mask, sigma_low=sigma_low, sigma_high=sigma_high, start_percent=start_percent, stop_percent=stop_percent, decay_mode=decay)
+            patch = ZImageControlPatch(model_patch, vae, image, strength, inpaint_image=inpaint_image, mask=mask, sigma_low=sigma_low, sigma_high=sigma_high, start_percent=start_percent, stop_percent=stop_percent, decay_mode=decay)
             model_patched.set_model_noise_refiner_patch(patch)
             model_patched.set_model_double_block_patch(patch)
         else:
