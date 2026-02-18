@@ -211,6 +211,9 @@ class ZImageControlPatch:
         self.temp_data = None
 
     def encode_latent_cond(self, control_image=None, inpaint_image=None):
+        if control_image is None and inpaint_image is None:
+             return None
+
         latent_image = None
         if control_image is not None:
             latent_image = comfy.latent_formats.Flux().process_in(self.vae.encode(control_image))
@@ -218,6 +221,10 @@ class ZImageControlPatch:
         if self.model_patch.model.additional_in_dim > 0:
             if inpaint_image is None:
                 inpaint_image = torch.ones_like(control_image) * 0.5
+            
+            # Additional check: what if control_image is None? We'd crash above.
+            # But the logic seems to imply we have at least one valid image.
+            # If control_image is None, inpaint_image MUST be not None (checked elsewhere or assumed).
             
             if self.mask is not None:
                 # Upscale mask for inpaint image
@@ -276,6 +283,9 @@ class ZImageControlPatch:
             loaded_models = comfy.model_management.loaded_models(only_currently_used=True)
             self.encoded_image = self.encode_latent_cond(image_scaled, inpaint_scaled)
             comfy.model_management.load_models_gpu(loaded_models)
+        
+        if self.encoded_image is None:
+            return kwargs
 
         cnet_blocks = self.model_patch.model.n_control_layers
         div = round(30 / cnet_blocks)
@@ -315,7 +325,8 @@ class ZImageControlPatch:
 
     def to(self, device_or_dtype):
         if isinstance(device_or_dtype, torch.device):
-            self.encoded_image = self.encoded_image.to(device_or_dtype)
+            if self.encoded_image is not None:
+                self.encoded_image = self.encoded_image.to(device_or_dtype)
             self.temp_data = None
         return self
 
